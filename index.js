@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // Health check endpoint
 app.get("/", (req, res) => {
@@ -18,7 +19,18 @@ app.get("/", (req, res) => {
       health: "GET /",
       generate: "POST /api/generate-tweet"
     },
-    version: "1.0.0"
+    version: "1.0.0",
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Test endpoint (no images)
+app.post("/api/test", async (req, res) => {
+  const { name, handle, tweet } = req.body;
+  
+  res.json({
+    received: { name, handle, tweet },
+    status: "API is working"
   });
 });
 
@@ -39,7 +51,7 @@ app.post("/api/generate-tweet", async (req, res) => {
 
     console.log(`[${new Date().toISOString()}] Generating quote for @${handle}`);
 
-    // Launch browser
+    // Launch browser with optimized settings
     browser = await puppeteer.launch({
       headless: "new",
       args: [
@@ -47,9 +59,12 @@ app.post("/api/generate-tweet", async (req, res) => {
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-accelerated-2d-canvas",
-        "--disable-gpu",
-        "--window-size=1500x1500"
-      ]
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process",
+        "--disable-gpu"
+      ],
+      timeout: 30000
     });
 
     const page = await browser.newPage();
@@ -58,8 +73,34 @@ app.post("/api/generate-tweet", async (req, res) => {
     await page.setViewport({ 
       width: 1500, 
       height: 1500,
-      deviceScaleFactor: 2
+      deviceScaleFactor: 1
     });
+
+    // Escape special characters
+    const escapedTweet = tweet
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;")
+      .replace(/\n/g, "<br>");
+
+    const escapedName = name
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+
+    const escapedHandle = handle
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+
+    // Default profile image (gray circle SVG)
+    const defaultProfileImage = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48'%3E%3Crect width='48' height='48' fill='%231f2937'/%3E%3C/svg%3E";
 
     // Generate HTML
     const html = `
@@ -161,7 +202,6 @@ app.post("/api/generate-tweet", async (req, res) => {
               color: white;
               font-size: 24px;
               line-height: 1.5;
-              white-space: pre-line;
               word-wrap: break-word;
             }
           </style>
@@ -172,53 +212,72 @@ app.post("/api/generate-tweet", async (req, res) => {
               <div class="profile-section">
                 <div class="profile-img-wrapper">
                   <img 
-                    src="${profileImage || "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48'%3E%3Crect width='48' height='48' fill='%231f2937'/%3E%3C/svg%3E"}" 
+                    src="${profileImage || defaultProfileImage}" 
                     class="profile-img" 
                     alt="Profile"
+                    onerror="this.src='${defaultProfileImage}'"
                   />
                 </div>
                 <div class="profile-info">
-                  <div class="name">${name}</div>
-                  <div class="handle">@${handle}</div>
+                  <div class="name">${escapedName}</div>
+                  <div class="handle">@${escapedHandle}</div>
                 </div>
                 <div class="menu-dots">•••</div>
               </div>
-              <div class="tweet-text">${tweet.replace(/\n/g, "<br>").replace(/'/g, "&#39;").replace(/"/g, "&quot;")}</div>
+              <div class="tweet-text">${escapedTweet}</div>
             </div>
           </div>
         </body>
       </html>
     `;
 
-    // Load HTML
+    // Load HTML and wait for everything
     await page.setContent(html, { 
-      waitUntil: "networkidle0",
+      waitUntil: ["networkidle0", "domcontentloaded"],
       timeout: 30000
     });
+
+    // Wait a bit extra for images to load
+    await page.waitForTimeout(1000);
 
     // Take screenshot
     const screenshot = await page.screenshot({ 
       type: "png",
-      omitBackground: false
+      omitBackground: false,
+      fullPage: false,
+      encoding: "binary" // Important: binary encoding
     });
 
-    console.log(`[${new Date().toISOString()}] Quote generated successfully`);
+    console.log(`[${new Date().toISOString()}] Screenshot generated: ${screenshot.length} bytes`);
 
-    // Send image
+    // Close browser before sending response
+    await browser.close();
+    browser = null;
+
+    // Send image with correct headers
     res.setHeader("Content-Type", "image/png");
-    res.setHeader("Content-Disposition", 'attachment; filename="twitter-quote.png"');
-    res.send(screenshot);
+    res.setHeader("Content-Length", screenshot.length);
+    res.setHeader("Cache-Control", "no-cache");
+    res.end(screenshot, "binary");
 
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error:`, error);
+    console.error(`[${new Date().toISOString()}] Error:`, error.message);
+    console.error(error.stack);
+    
+    // Make sure to close browser on error
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (closeError) {
+        console.error("Error closing browser:", closeError);
+      }
+    }
+    
     res.status(500).json({
       error: "Failed to generate quote image",
-      message: error.message
+      message: error.message,
+      timestamp: new Date().toISOString()
     });
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
   }
 });
 
@@ -226,7 +285,17 @@ app.post("/api/generate-tweet", async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({
     error: "Not found",
-    path: req.path
+    path: req.path,
+    method: req.method
+  });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({
+    error: "Internal server error",
+    message: err.message
   });
 });
 
@@ -234,5 +303,6 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ API running on http://localhost:${PORT}`);
   console.log(`📝 Health check: http://localhost:${PORT}/`);
+  console.log(`🧪 Test endpoint: http://localhost:${PORT}/api/test`);
   console.log(`🚀 Generate endpoint: http://localhost:${PORT}/api/generate-tweet`);
 });
